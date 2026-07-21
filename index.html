@@ -17,10 +17,11 @@
 <div id="ld">読み込み中…</div>
 <iframe id="f" title="森のしごと村" style="display:none"></iframe>
 <script>
-// 予備入口（Vercel等の静的ホスティング用）。
-// 本体はSupabase Edge Function側にあり、ここは読み込むだけ。鍵・秘密は一切含まない。
+// 入口ページ（GitHub Pages）。本体はSupabase Edge Function側。ここは読み込みと通知の橋渡しだけ。鍵・秘密は含まない。
 (function(){
   var BASE = 'https://ngggmlbvnnrtklftdrkg.supabase.co/functions/v1/mura';
+
+  // 本体HTMLを読み込んでiframeに流し込む
   var h = {};
   try { var t = localStorage.getItem('mura_t'); if (t) h['X-Mura-S'] = t; } catch(e){}
   fetch(BASE + '/page', {cache:'no-store', headers:h})
@@ -31,8 +32,75 @@
       document.getElementById('ld').style.display = 'none';
     })
     .catch(function(e){ document.getElementById('ld').textContent = '読み込みに失敗しました。再読み込みしてください。(' + e + ')'; });
+
+  if ('serviceWorker' in navigator) { try { navigator.serviceWorker.register('sw.js'); } catch(e){} }
+
+  /* ---- 通知（Web Push）：SWを持つこの親ページが担当。iframeからpostMessageで依頼される ---- */
+  function tok(){ try { return localStorage.getItem('mura_t'); } catch(e){ return null; } }
+  function muraFetch(path, bodyObj){
+    var hd = { 'Content-Type':'application/json' };
+    var tk = tok(); if (tk) hd['X-Mura-S'] = tk;
+    return fetch(BASE + path, { method:'POST', headers:hd, body: JSON.stringify(bodyObj||{}) }).then(function(r){ return r.json(); });
+  }
+  function b64ToU8(base64){
+    var pad = '='.repeat((4 - base64.length % 4) % 4);
+    var s = (base64 + pad).replace(/-/g,'+').replace(/_/g,'/');
+    var raw = atob(s); var out = new Uint8Array(raw.length);
+    for (var i=0;i<raw.length;i++) out[i] = raw.charCodeAt(i);
+    return out;
+  }
+  function supported(){ return ('serviceWorker' in navigator) && ('PushManager' in window) && ('Notification' in window); }
+
+  function pushStatus(){
+    if (!supported()) return Promise.resolve({ state:'unsupported' });
+    if (Notification.permission === 'denied') return Promise.resolve({ state:'denied' });
+    return navigator.serviceWorker.ready.then(function(reg){
+      return reg.pushManager.getSubscription().then(function(sub){
+        if (sub) return { state:'granted-on' };
+        return { state: Notification.permission === 'granted' ? 'granted-off' : 'default' };
+      });
+    }).catch(function(){ return { state:'default' }; });
+  }
+  function pushEnable(){
+    if (!supported()) return Promise.resolve({ ok:false, state:'unsupported' });
+    return Promise.resolve(Notification.requestPermission()).then(function(perm){
+      if (perm !== 'granted') return { ok:false, state: perm === 'denied' ? 'denied' : 'default' };
+      return fetch(BASE + '/api/push/vapid').then(function(r){ return r.json(); }).then(function(v){
+        return navigator.serviceWorker.ready.then(function(reg){
+          return reg.pushManager.subscribe({ userVisibleOnly:true, applicationServerKey: b64ToU8(v.key) });
+        });
+      }).then(function(sub){
+        var j = sub.toJSON();
+        return muraFetch('/api/push/subscribe', { endpoint: sub.endpoint, p256dh: j.keys.p256dh, auth: j.keys.auth, ua: navigator.userAgent })
+          .then(function(){ return { ok:true, state:'granted-on' }; });
+      });
+    }).catch(function(e){ return { ok:false, state:'default', error:String(e) }; });
+  }
+  function pushDisable(){
+    if (!supported()) return Promise.resolve({ ok:true, state:'unsupported' });
+    return navigator.serviceWorker.ready.then(function(reg){
+      return reg.pushManager.getSubscription().then(function(sub){
+        if (!sub) return { ok:true, state:'granted-off' };
+        return muraFetch('/api/push/unsubscribe', { endpoint: sub.endpoint }).then(function(){
+          return sub.unsubscribe().then(function(){ return { ok:true, state:'granted-off' }; });
+        });
+      });
+    }).catch(function(e){ return { ok:false, error:String(e) }; });
+  }
+  function pushTest(){
+    return muraFetch('/api/push/test', {}).then(function(r){ return { ok: !!r.ok, sent: r.sent||0 }; });
+  }
+
+  window.addEventListener('message', function(e){
+    var d = e.data; if (!d || d.mura !== 'push') return;
+    var src = e.source;
+    var done = function(res){ res = res || {}; res.mura='push-result'; res.id=d.id; res.action=d.action; try{ src.postMessage(res, '*'); }catch(_){} };
+    if (d.action === 'status') pushStatus().then(done);
+    else if (d.action === 'enable') pushEnable().then(done);
+    else if (d.action === 'disable') pushDisable().then(done);
+    else if (d.action === 'test') pushTest().then(done);
+  });
 })();
-if ('serviceWorker' in navigator) { try { navigator.serviceWorker.register('sw.js'); } catch(e){} }
 </script>
 </body>
 </html>
